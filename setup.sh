@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SSH 安全配置一键脚本
+# SSH 安全配置一键脚本 - 改进版
 # 使用方法: sudo bash ssh_security.sh
 
 set -e
@@ -42,6 +42,11 @@ backup_config() {
         log "SSH 配置文件已备份到: $backup_dir/sshd_config"
     fi
     
+    # 备份当前的防火墙规则
+    if command -v ufw &> /dev/null; then
+        ufw status numbered > "$backup_dir/ufw_rules.txt" 2>/dev/null || true
+    fi
+    
     echo "$backup_dir" > /tmp/ssh_backup_path
 }
 
@@ -68,40 +73,65 @@ get_beiqi7_keys() {
     log "正在从 GitHub 获取 beiqi7 的公钥..."
     
     local github_keys_url="https://github.com/beiqi7.keys"
-    local temp_keys="/tmp/github_keys_$"
+    local temp_keys="/tmp/github_keys_$$"
     
-    if curl -sf "$github_keys_url" -o "$temp_keys"; then
-        if [[ -s "$temp_keys" ]]; then
-            local key_count=$(wc -l < "$temp_keys")
-            echo "找到 $key_count 个公钥:"
-            echo "----------------------------------------"
-            cat "$temp_keys" | nl -w2 -s') '
-            echo "----------------------------------------"
-            
-            # 检测是否通过管道运行
-            if [[ -t 0 ]]; then
-                read -p "是否添加所有公钥? [Y/n]: " confirm
-                confirm=${confirm:-Y}
+    # 添加重试机制
+    local retry_count=3
+    local retry_delay=2
+    
+    for i in $(seq 1 $retry_count); do
+        if curl -sf "$github_keys_url" -o "$temp_keys"; then
+            if [[ -s "$temp_keys" ]]; then
+                local key_count=$(wc -l < "$temp_keys")
+                echo "找到 $key_count 个公钥:"
+                echo "----------------------------------------"
+                cat "$temp_keys" | nl -w2 -s') '
+                echo "----------------------------------------"
+                
+                # 检测是否通过管道运行
+                if [[ -t 0 ]]; then
+                    read -p "是否添加所有公钥? [Y/n]: " confirm
+                    confirm=${confirm:-Y}
+                else
+                    confirm="Y"
+                    echo "检测到管道模式，自动确认添加公钥..."
+                fi
+                
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    # 创建临时文件并设置权限
+                    local temp_auth="/tmp/authorized_keys_$$"
+                    touch "$temp_auth"
+                    chmod 600 "$temp_auth"
+                    
+                    # 如果已有authorized_keys，先复制
+                    if [[ -f "$ssh_dir/authorized_keys" ]]; then
+                        cat "$ssh_dir/authorized_keys" > "$temp_auth"
+                    fi
+                    
+                    # 添加新密钥
+                    cat "$temp_keys" >> "$temp_auth"
+                    
+                    # 原子性移动文件
+                    mv "$temp_auth" "$ssh_dir/authorized_keys"
+                    chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
+                    
+                    log "已成功添加 $key_count 个公钥"
+                    rm -f "$temp_keys"
+                    return 0
+                else
+                    error "操作已取消，无法继续配置 SSH 安全设置"
+                fi
             else
-                confirm="Y"
-                echo "检测到管道模式，自动确认添加公钥..."
-            fi
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                cat "$temp_keys" >> "$ssh_dir/authorized_keys"
-                chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
-                chmod 600 "$ssh_dir/authorized_keys"
-                log "已成功添加 $key_count 个公钥"
-            else
-                error "操作已取消，无法继续配置 SSH 安全设置"
+                warn "GitHub 用户 beiqi7 没有公开的 SSH 密钥"
             fi
         else
-            error "GitHub 用户 beiqi7 没有公开的 SSH 密钥，请先在 GitHub 中添加 SSH 密钥"
+            warn "第 $i 次尝试失败，等待 $retry_delay 秒后重试..."
+            sleep $retry_delay
         fi
-    else
-        error "无法获取 GitHub 用户 beiqi7 的公钥，请检查网络连接"
-    fi
+    done
     
     rm -f "$temp_keys"
+    error "无法获取 GitHub 用户 beiqi7 的公钥，请检查网络连接"
 }
 
 # 配置密钥认证
@@ -120,11 +150,13 @@ setup_key_auth() {
     # 检查是否已有密钥
     if [[ -f "$ssh_dir/authorized_keys" ]] && [[ -s "$ssh_dir/authorized_keys" ]]; then
         log "检测到已有 SSH 密钥配置"
-        read -p "是否追加新的公钥? [Y/n]: " append_key
-        append_key=${append_key:-Y}
-        if [[ ! "$append_key" =~ ^[Yy]$ ]]; then
-            log "保持现有密钥配置"
-            return 0
+        if [[ -t 0 ]]; then
+            read -p "是否追加新的公钥? [Y/n]: " append_key
+            append_key=${append_key:-Y}
+            if [[ ! "$append_key" =~ ^[Yy]$ ]]; then
+                log "保持现有密钥配置"
+                return 0
+            fi
         fi
     fi
     
@@ -132,167 +164,56 @@ setup_key_auth() {
     get_beiqi7_keys
 }
 
-# 生成 SSH 密钥对
-generate_ssh_key() {
-    local user_home=$(eval echo ~$CURRENT_USER)
-    local ssh_dir="$user_home/.ssh"
+# 更新SSH配置（不覆盖整个文件）
+update_ssh_config() {
+    local config_file="/etc/ssh/sshd_config"
+    local temp_config="/tmp/sshd_config_$$"
+    local new_port="$1"
     
-    # 生成密钥对
-    sudo -u "$CURRENT_USER" ssh-keygen -t rsa -b 4096 -f "$ssh_dir/id_rsa" -N "" -C "$CURRENT_USER@$(hostname)"
+    # 复制原配置
+    cp "$config_file" "$temp_config"
     
-    # 设置 authorized_keys
-    sudo -u "$CURRENT_USER" cp "$ssh_dir/id_rsa.pub" "$ssh_dir/authorized_keys"
-    chmod 600 "$ssh_dir/authorized_keys"
+    # 定义要更新的配置项
+    declare -A configs=(
+        ["Port"]="$new_port"
+        ["Protocol"]="2"
+        ["PubkeyAuthentication"]="yes"
+        ["PasswordAuthentication"]="no"
+        ["PermitEmptyPasswords"]="no"
+        ["ChallengeResponseAuthentication"]="no"
+        ["PermitRootLogin"]="no"
+        ["AllowUsers"]="$CURRENT_USER"
+        ["MaxAuthTries"]="3"
+        ["MaxSessions"]="2"
+        ["ClientAliveInterval"]="300"
+        ["ClientAliveCountMax"]="2"
+        ["LoginGraceTime"]="60"
+        ["X11Forwarding"]="no"
+        ["StrictModes"]="yes"
+        ["UsePAM"]="yes"
+    )
     
-    log "SSH 密钥对已生成"
-    log "私钥位置: $ssh_dir/id_rsa"
-    log "公钥位置: $ssh_dir/id_rsa.pub"
-    
-    echo
-    warn "请立即下载私钥文件到本地，并妥善保管！"
-    echo "私钥内容:"
-    echo "----------------------------------------"
-    cat "$ssh_dir/id_rsa"
-    echo "----------------------------------------"
-    echo
-    read -p "请确认已保存私钥，按 Enter 继续..."
-}
-
-# 从 GitHub 获取公钥
-get_github_key() {
-    local user_home=$(eval echo ~$CURRENT_USER)
-    local ssh_dir="$user_home/.ssh"
-    
-    echo "请选择公钥来源:"
-    echo "1) 从 beiqi7 GitHub 用户获取 (推荐)"
-    echo "2) 从 ssh-security 仓库获取"
-    echo "3) 手动粘贴公钥"
-    
-    read -p "请选择 [1-3]: " key_source
-    
-    case $key_source in
-        1)
-            get_beiqi7_keys
-            ;;
-        2)
-            get_repo_keys
-            ;;
-        3)
-            add_manual_key
-            ;;
-        *)
-            error "无效选择"
-            ;;
-    esac
-}
-
-# 从 GitHub 用户获取公钥
-get_github_user_keys() {
-    local user_home=$(eval echo ~$CURRENT_USER)
-    local ssh_dir="$user_home/.ssh"
-    
-    read -p "请输入 GitHub 用户名: " github_user
-    
-    if [[ -z "$github_user" ]]; then
-        error "GitHub 用户名不能为空"
-    fi
-    
-    log "正在从 GitHub 获取用户 $github_user 的公钥..."
-    
-    local github_keys_url="https://github.com/$github_user.keys"
-    local temp_keys="/tmp/github_keys_$"
-    
-    if curl -sf "$github_keys_url" -o "$temp_keys"; then
-        if [[ -s "$temp_keys" ]]; then
-            echo "找到以下公钥:"
-            echo "----------------------------------------"
-            cat "$temp_keys" | nl -w2 -s') '
-            echo "----------------------------------------"
-            
-            read -p "是否添加所有公钥? [y/N]: " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                cat "$temp_keys" >> "$ssh_dir/authorized_keys"
-                chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
-                chmod 600 "$ssh_dir/authorized_keys"
-                log "已添加 $(wc -l < "$temp_keys") 个公钥"
-            else
-                warn "操作已取消"
-            fi
+    # 更新配置项
+    for key in "${!configs[@]}"; do
+        if grep -q "^#*${key}\s" "$temp_config"; then
+            sed -i "s/^#*${key}\s.*/${key} ${configs[$key]}/" "$temp_config"
         else
-            error "用户 $github_user 没有公开的 SSH 密钥"
+            echo "${key} ${configs[$key]}" >> "$temp_config"
         fi
+    done
+    
+    # 验证配置
+    if sshd -t -f "$temp_config" &>/dev/null; then
+        mv "$temp_config" "$config_file"
+        log "SSH 配置已更新"
     else
-        error "无法获取 GitHub 用户 $github_user 的公钥，请检查用户名或网络连接"
+        rm -f "$temp_config"
+        error "SSH 配置验证失败"
     fi
-    
-    rm -f "$temp_keys"
-}
-
-# 从 GitHub raw 文件获取公钥
-get_github_raw_key() {
-    local user_home=$(eval echo ~$CURRENT_USER)
-    local ssh_dir="$user_home/.ssh"
-    
-    echo "请输入 GitHub raw 文件 URL (例如: https://raw.githubusercontent.com/username/repo/main/id_rsa.pub):"
-    read -r github_url
-    
-    if [[ -z "$github_url" ]]; then
-        error "URL 不能为空"
-    fi
-    
-    log "正在从 GitHub 获取公钥文件..."
-    
-    local temp_key="/tmp/github_key_$"
-    
-    if curl -sf "$github_url" -o "$temp_key"; then
-        if [[ -s "$temp_key" ]]; then
-            echo "公钥内容:"
-            echo "----------------------------------------"
-            cat "$temp_key"
-            echo "----------------------------------------"
-            
-            read -p "是否添加此公钥? [y/N]: " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                cat "$temp_key" >> "$ssh_dir/authorized_keys"
-                chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
-                chmod 600 "$ssh_dir/authorized_keys"
-                log "公钥已添加"
-            else
-                warn "操作已取消"
-            fi
-        else
-            error "获取到的文件为空"
-        fi
-    else
-        error "无法获取公钥文件，请检查 URL 或网络连接"
-    fi
-    
-    rm -f "$temp_key"
-}
-
-# 手动添加公钥
-add_manual_key() {
-    local user_home=$(eval echo ~$CURRENT_USER)
-    local ssh_dir="$user_home/.ssh"
-    
-    echo "请粘贴您的 SSH 公钥 (通常以 ssh-rsa 或 ssh-ed25519 开头):"
-    read -r public_key
-    
-    if [[ -z "$public_key" ]]; then
-        error "公钥不能为空"
-    fi
-    
-    echo "$public_key" >> "$ssh_dir/authorized_keys"
-    chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
-    chmod 600 "$ssh_dir/authorized_keys"
-    
-    log "SSH 公钥已添加"
 }
 
 # 配置 SSH 安全设置
 configure_ssh() {
-    local config_file="/etc/ssh/sshd_config"
-    
     log "开始配置 SSH 安全设置..."
     
     # 读取自定义端口
@@ -304,65 +225,13 @@ configure_ssh() {
     fi
     new_port=${new_port:-22}
     
-    # 验证端口范围
-    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [[ $new_port -lt 1 ]] || [[ $new_port -gt 65535 ]]; then
+    # 验证端口范围（修正数值比较）
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 )) || (( new_port > 65535 )); then
         error "无效的端口号: $new_port"
     fi
     
-    # 创建新的配置文件
-    cat > "$config_file" << EOF
-# SSH 安全配置 - 由脚本自动生成于 $(date)
-
-# 基础设置
-Port $new_port
-AddressFamily inet
-ListenAddress 0.0.0.0
-
-# 协议和加密
-Protocol 2
-HostKey /etc/ssh/ssh_host_rsa_key
-HostKey /etc/ssh/ssh_host_ecdsa_key
-HostKey /etc/ssh/ssh_host_ed25519_key
-
-# 认证设置
-PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys
-PasswordAuthentication no
-PermitEmptyPasswords no
-ChallengeResponseAuthentication no
-UsePAM yes
-
-# 用户和权限
-PermitRootLogin no
-AllowUsers $CURRENT_USER
-MaxAuthTries 3
-MaxSessions 2
-
-# 连接设置
-ClientAliveInterval 300
-ClientAliveCountMax 2
-LoginGraceTime 60
-MaxStartups 2:30:10
-
-# 安全选项
-X11Forwarding no
-AllowTcpForwarding no
-AllowAgentForwarding no
-PermitTunnel no
-PermitUserEnvironment no
-StrictModes yes
-
-# 日志
-SyslogFacility AUTH
-LogLevel INFO
-
-# Banner
-Banner /etc/ssh/banner
-EOF
-
-    log "SSH 配置已更新"
-    log "新端口: $new_port"
-    log "仅允许用户: $CURRENT_USER"
+    # 更新配置而不是覆盖
+    update_ssh_config "$new_port"
 }
 
 # 创建登录横幅
@@ -376,28 +245,47 @@ monitored. Unauthorized access is prohibited and will be prosecuted to the
 full extent of the law.
 ================================================================================
 EOF
+    
+    # 确保banner配置已启用
+    if ! grep -q "^Banner\s*/etc/ssh/banner" /etc/ssh/sshd_config; then
+        echo "Banner /etc/ssh/banner" >> /etc/ssh/sshd_config
+    fi
+    
     log "SSH 登录横幅已创建"
 }
 
-# 配置防火墙
+# 配置防火墙（更安全的方式）
 configure_firewall() {
     local ssh_port=$(grep "^Port" /etc/ssh/sshd_config | awk '{print $2}')
     
     # 检查防火墙类型
     if command -v ufw &> /dev/null; then
         log "配置 UFW 防火墙..."
-        ufw --force reset
-        ufw default deny incoming
-        ufw default allow outgoing
+        
+        # 先添加新规则，再删除旧规则
         ufw allow "$ssh_port"/tcp
+        
+        # 如果端口改变了，删除默认的22端口
+        if [[ "$ssh_port" != "22" ]]; then
+            ufw delete allow 22/tcp 2>/dev/null || true
+        fi
+        
         ufw --force enable
         log "UFW 防火墙已配置"
+        
     elif command -v firewall-cmd &> /dev/null; then
         log "配置 firewalld 防火墙..."
         systemctl start firewalld
         systemctl enable firewalld
-        firewall-cmd --permanent --remove-service=ssh
+        
+        # 添加新端口
         firewall-cmd --permanent --add-port="$ssh_port"/tcp
+        
+        # 如果端口改变了，移除ssh服务
+        if [[ "$ssh_port" != "22" ]]; then
+            firewall-cmd --permanent --remove-service=ssh
+        fi
+        
         firewall-cmd --reload
         log "firewalld 防火墙已配置"
     else
@@ -412,27 +300,46 @@ test_ssh_config() {
     
     if sshd -T &>/dev/null; then
         log "SSH 配置语法检查通过"
+        return 0
     else
         error "SSH 配置语法错误，请检查配置文件"
+        return 1
     fi
 }
 
-# 重启 SSH 服务
+# 重启 SSH 服务（带回滚）
 restart_ssh() {
     log "重启 SSH 服务..."
     
+    local service_name=""
     if systemctl is-active --quiet sshd; then
-        systemctl restart sshd
+        service_name="sshd"
     elif systemctl is-active --quiet ssh; then
-        systemctl restart ssh
+        service_name="ssh"
     else
         error "无法确定 SSH 服务名称"
     fi
     
-    if systemctl is-active --quiet sshd || systemctl is-active --quiet ssh; then
-        log "SSH 服务重启成功"
+    # 保存当前状态
+    local backup_path=$(cat /tmp/ssh_backup_path)
+    
+    # 尝试重启
+    if systemctl restart "$service_name"; then
+        sleep 2
+        if systemctl is-active --quiet "$service_name"; then
+            log "SSH 服务重启成功"
+            return 0
+        fi
+    fi
+    
+    # 重启失败，尝试恢复
+    warn "SSH 服务重启失败，尝试恢复原配置..."
+    if [[ -f "$backup_path/sshd_config" ]]; then
+        cp "$backup_path/sshd_config" /etc/ssh/sshd_config
+        systemctl restart "$service_name"
+        error "SSH 服务重启失败，已恢复原配置"
     else
-        error "SSH 服务重启失败"
+        error "SSH 服务重启失败，且无法恢复原配置"
     fi
 }
 
@@ -440,6 +347,7 @@ restart_ssh() {
 show_summary() {
     local ssh_port=$(grep "^Port" /etc/ssh/sshd_config | awk '{print $2}')
     local backup_path=$(cat /tmp/ssh_backup_path 2>/dev/null || echo "未知")
+    local server_ip=$(hostname -I | awk '{print $1}')
     
     echo
     echo "========================================"
@@ -450,20 +358,27 @@ show_summary() {
     echo "认证方式: 仅密钥认证 (从 GitHub beiqi7 获取)"
     echo "Root 登录: 已禁用"
     echo "配置备份: $backup_path"
+    echo "服务器 IP: $server_ip"
     echo "========================================"
     echo
     warn "重要提醒:"
-    echo "1. 请确保 Termius 中有对应的私钥"
-    echo "2. 请使用新端口和密钥测试连接"
-    echo "3. 确认连接正常后再断开当前会话"
-    echo "4. 新的连接命令: ssh -p $ssh_port $CURRENT_USER@$(hostname -I | awk '{print $1}')"
+    echo "1. 请确保已保存相应的私钥"
+    echo "2. 建议先测试新配置，不要立即关闭当前会话"
+    echo "3. 测试连接命令: ssh -p $ssh_port $CURRENT_USER@$server_ip"
+    echo "4. 如遇问题，可从备份恢复: $backup_path/sshd_config"
     echo "5. 一键脚本地址: curl -sSL https://raw.githubusercontent.com/beiqi7/ssh-security/main/setup.sh | sudo bash"
     echo
+    
+    # 清理临时文件
+    rm -f /tmp/ssh_backup_path
 }
 
 # 主函数
 main() {
     log "开始 SSH 安全配置..."
+    
+    # 设置陷阱，确保清理临时文件
+    trap 'rm -f /tmp/*_$$' EXIT
     
     check_root
     backup_config
