@@ -78,8 +78,14 @@ get_beiqi7_keys() {
             cat "$temp_keys" | nl -w2 -s') '
             echo "----------------------------------------"
             
-            read -p "是否添加所有公钥? [Y/n]: " confirm
-            confirm=${confirm:-Y}
+            # 检测是否通过管道运行
+            if [[ -t 0 ]]; then
+                read -p "是否添加所有公钥? [Y/n]: " confirm
+                confirm=${confirm:-Y}
+            else
+                confirm="Y"
+                echo "检测到管道模式，自动确认添加公钥..."
+            fi
             if [[ "$confirm" =~ ^[Yy]$ ]]; then
                 cat "$temp_keys" >> "$ssh_dir/authorized_keys"
                 chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
@@ -290,7 +296,12 @@ configure_ssh() {
     log "开始配置 SSH 安全设置..."
     
     # 读取自定义端口
-    read -p "请输入新的 SSH 端口 (默认: 22): " new_port
+    if [[ -t 0 ]]; then
+        read -p "请输入新的 SSH 端口 (默认: 22): " new_port
+    else
+        echo "检测到管道模式，使用默认端口 22"
+        new_port="22"
+    fi
     new_port=${new_port:-22}
     
     # 验证端口范围
