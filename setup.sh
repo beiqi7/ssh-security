@@ -60,6 +60,44 @@ get_user_info() {
     log "将为用户 $CURRENT_USER 保留 SSH 访问权限"
 }
 
+# 从 beiqi7 GitHub 获取公钥
+get_beiqi7_keys() {
+    local user_home=$(eval echo ~$CURRENT_USER)
+    local ssh_dir="$user_home/.ssh"
+    
+    log "正在从 GitHub 获取 beiqi7 的公钥..."
+    
+    local github_keys_url="https://github.com/beiqi7.keys"
+    local temp_keys="/tmp/github_keys_$"
+    
+    if curl -sf "$github_keys_url" -o "$temp_keys"; then
+        if [[ -s "$temp_keys" ]]; then
+            local key_count=$(wc -l < "$temp_keys")
+            echo "找到 $key_count 个公钥:"
+            echo "----------------------------------------"
+            cat "$temp_keys" | nl -w2 -s') '
+            echo "----------------------------------------"
+            
+            read -p "是否添加所有公钥? [Y/n]: " confirm
+            confirm=${confirm:-Y}
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                cat "$temp_keys" >> "$ssh_dir/authorized_keys"
+                chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
+                chmod 600 "$ssh_dir/authorized_keys"
+                log "已成功添加 $key_count 个公钥"
+            else
+                error "操作已取消，无法继续配置 SSH 安全设置"
+            fi
+        else
+            error "GitHub 用户 beiqi7 没有公开的 SSH 密钥，请先在 GitHub 中添加 SSH 密钥"
+        fi
+    else
+        error "无法获取 GitHub 用户 beiqi7 的公钥，请检查网络连接"
+    fi
+    
+    rm -f "$temp_keys"
+}
+
 # 配置密钥认证
 setup_key_auth() {
     local user_home=$(eval echo ~$CURRENT_USER)
