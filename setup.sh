@@ -76,35 +76,16 @@ setup_key_auth() {
     # 检查是否已有密钥
     if [[ -f "$ssh_dir/authorized_keys" ]] && [[ -s "$ssh_dir/authorized_keys" ]]; then
         log "检测到已有 SSH 密钥配置"
-        return 0
+        read -p "是否追加新的公钥? [Y/n]: " append_key
+        append_key=${append_key:-Y}
+        if [[ ! "$append_key" =~ ^[Yy]$ ]]; then
+            log "保持现有密钥配置"
+            return 0
+        fi
     fi
     
-    warn "未检测到 SSH 密钥配置"
-    echo "请选择操作:"
-    echo "1) 从 GitHub 获取公钥 (推荐)"
-    echo "2) 生成新的 SSH 密钥对"
-    echo "3) 手动添加公钥"
-    echo "4) 跳过密钥配置 (不推荐)"
-    
-    read -p "请选择 [1-4]: " key_choice
-    
-    case $key_choice in
-        1)
-            get_github_key
-            ;;
-        2)
-            generate_ssh_key
-            ;;
-        3)
-            add_manual_key
-            ;;
-        4)
-            warn "跳过密钥配置，建议稍后手动配置"
-            ;;
-        *)
-            error "无效选择"
-            ;;
-    esac
+    # 直接从 beiqi7 GitHub 获取公钥
+    get_beiqi7_keys
 }
 
 # 生成 SSH 密钥对
@@ -139,18 +120,18 @@ get_github_key() {
     local ssh_dir="$user_home/.ssh"
     
     echo "请选择公钥来源:"
-    echo "1) 从 GitHub 用户获取 (推荐)"
-    echo "2) 从 GitHub raw 文件获取"
+    echo "1) 从 beiqi7 GitHub 用户获取 (推荐)"
+    echo "2) 从 ssh-security 仓库获取"
     echo "3) 手动粘贴公钥"
     
     read -p "请选择 [1-3]: " key_source
     
     case $key_source in
         1)
-            get_github_user_keys
+            get_beiqi7_keys
             ;;
         2)
-            get_github_raw_key
+            get_repo_keys
             ;;
         3)
             add_manual_key
@@ -417,16 +398,17 @@ show_summary() {
     echo "========================================"
     echo "SSH 端口: $ssh_port"
     echo "允许用户: $CURRENT_USER"
-    echo "认证方式: 仅密钥认证"
+    echo "认证方式: 仅密钥认证 (从 GitHub beiqi7 获取)"
     echo "Root 登录: 已禁用"
     echo "配置备份: $backup_path"
     echo "========================================"
     echo
     warn "重要提醒:"
-    echo "1. 请确保已保存 SSH 私钥"
+    echo "1. 请确保 Termius 中有对应的私钥"
     echo "2. 请使用新端口和密钥测试连接"
     echo "3. 确认连接正常后再断开当前会话"
-    echo "4. 新的连接命令: ssh -p $ssh_port -i /path/to/private_key $CURRENT_USER@$(hostname -I | awk '{print $1}')"
+    echo "4. 新的连接命令: ssh -p $ssh_port $CURRENT_USER@$(hostname -I | awk '{print $1}')"
+    echo "5. 一键脚本地址: curl -sSL https://raw.githubusercontent.com/beiqi7/ssh-security/main/setup.sh | sudo bash"
     echo
 }
 
