@@ -236,6 +236,12 @@ update_ssh_config() {
     # 复制原配置
     cp "$config_file" "$temp_config"
     
+    # 构建AllowUsers列表，避免重复
+    local allow_users="root"
+    if [[ "$CURRENT_USER" != "root" ]]; then
+        allow_users="root $CURRENT_USER"
+    fi
+    
     # 定义要更新的配置项（严格安全配置）
     declare -A configs=(
         ["Port"]="$new_port"
@@ -245,7 +251,7 @@ update_ssh_config() {
         ["PermitEmptyPasswords"]="no"
         ["ChallengeResponseAuthentication"]="no"
         ["PermitRootLogin"]="yes"  # 允许root登录（使用公钥）
-        ["AllowUsers"]="root $CURRENT_USER"  # 明确允许root和配置的用户
+        ["AllowUsers"]="$allow_users"  # 智能构建用户列表
         ["MaxAuthTries"]="3"
         ["MaxSessions"]="5"
         ["ClientAliveInterval"]="300"
@@ -430,8 +436,13 @@ show_summary() {
     echo
     warn "重要提醒:"
     echo "1. SSH已配置为仅公钥认证，密码认证已关闭"
-    echo "2. 已为 root 和 $CURRENT_USER 用户添加了 GitHub beiqi7 的公钥"
-    echo "3. 仅允许 root 和 $CURRENT_USER 用户登录"
+    if [[ "$CURRENT_USER" == "root" ]]; then
+        echo "2. 已为 root 用户添加了 GitHub beiqi7 的公钥"
+        echo "3. 仅允许 root 用户登录"
+    else
+        echo "2. 已为 root 和 $CURRENT_USER 用户添加了 GitHub beiqi7 的公钥"
+        echo "3. 仅允许 root 和 $CURRENT_USER 用户登录"
+    fi
     echo "4. 请确保已保存对应的私钥文件"
     echo "5. 测试连接: ssh -p $ssh_port root@$server_ip"
     echo "6. 如遇问题，可使用应急恢复: curl -sSL https://raw.githubusercontent.com/beiqi7/ssh-security/main/setup.sh | sudo bash -s -- --recover"
