@@ -2,6 +2,7 @@
 
 # SSH 安全配置一键脚本 - 改进版
 # 使用方法: sudo bash ssh_security.sh
+# 应急恢复: sudo bash ssh_security.sh --recover
 
 set -e
 
@@ -24,6 +25,44 @@ error() {
     echo -e "${RED}[ERROR]${NC} $1"
     exit 1
 }
+
+# 应急恢复功能
+emergency_recover() {
+    log "启动应急恢复模式..."
+    
+    # 查找最新的备份
+    local backup_dir=$(find /root -name "ssh_backup_*" -type d 2>/dev/null | sort -r | head -1)
+    
+    if [[ -n "$backup_dir" && -f "$backup_dir/sshd_config" ]]; then
+        log "找到备份配置: $backup_dir/sshd_config"
+        cp "$backup_dir/sshd_config" /etc/ssh/sshd_config
+        log "SSH配置文件已恢复"
+    else
+        warn "未找到备份配置，创建允许密码认证的临时配置..."
+        
+        # 临时启用密码认证
+        sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+        sed -i 's/^PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
+        
+        # 如果还有AllowUsers限制，注释掉
+        sed -i 's/^AllowUsers/#AllowUsers/' /etc/ssh/sshd_config 2>/dev/null || true
+    fi
+    
+    # 重启SSH服务
+    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+        log "SSH服务重启成功"
+        log "应急恢复完成！现在应该可以使用密码登录了。"
+    else
+        error "SSH服务重启失败"
+    fi
+    
+    exit 0
+}
+
+# 检查是否为应急恢复模式
+if [[ "$1" == "--recover" ]]; then
+    emergency_recover
+fi
 
 # 检查是否为 root 用户
 check_root() {
@@ -84,15 +123,64 @@ get_user_info() {
     log "将为用户 $CURRENT_USER 保留 SSH 访问权限"
 }
 
-# 从 beiqi7 GitHub 获取公钥
-get_beiqi7_keys() {
-    local user_home=$(eval echo ~$CURRENT_USER)
+# 配置密钥认证
+setup_key_auth() {
+    # 为选定用户配置密钥
+    setup_user_keys "$CURRENT_USER"
+    
+    # 如果选定用户不是root，也为root配置密钥
+    if [[ "$CURRENT_USER" != "root" ]]; then
+        log "同时为root用户配置SSH密钥..."
+        setup_user_keys "root"
+    fi
+}
+
+# 为指定用户设置SSH密钥
+setup_user_keys() {
+    local user="$1"
+    local user_home=$(eval echo ~$user)
     local ssh_dir="$user_home/.ssh"
     
-    log "正在从 GitHub 获取 beiqi7 的公钥..."
+    log "为用户 $user 配置SSH密钥..."
+    
+    # 创建 .ssh 目录
+    if [[ ! -d "$ssh_dir" ]]; then
+        mkdir -p "$ssh_dir"
+        chown "$user:$user" "$ssh_dir"
+        chmod 700 "$ssh_dir"
+        log "已创建 .ssh 目录: $ssh_dir"
+    fi
+    
+    # 检查是否已有密钥
+    if [[ -f "$ssh_dir/authorized_keys" ]] && [[ -s "$ssh_dir/authorized_keys" ]]; then
+        log "检测到用户 $user 已有 SSH 密钥配置"
+        if [[ -t 0 ]]; then
+            read -p "是否为用户 $user 追加新的公钥? [Y/n]: " append_key
+            append_key=${append_key:-Y}
+            if [[ ! "$append_key" =~ ^[Yy]$ ]]; then
+                log "保持用户 $user 现有密钥配置"
+                return 0
+            fi
+        else
+            echo "检测到管道模式，自动为用户 $user 确认追加公钥..."
+            append_key="Y"
+        fi
+    fi
+    
+    # 从 beiqi7 GitHub 获取公钥
+    get_beiqi7_keys_for_user "$user"
+}
+
+# 从 beiqi7 GitHub 为指定用户获取公钥
+get_beiqi7_keys_for_user() {
+    local user="$1"
+    local user_home=$(eval echo ~$user)
+    local ssh_dir="$user_home/.ssh"
+    
+    log "正在为用户 $user 从 GitHub 获取 beiqi7 的公钥..."
     
     local github_keys_url="https://github.com/beiqi7.keys"
-    local temp_keys="/tmp/github_keys_$$"
+    local temp_keys="/tmp/github_keys_${user}_$$"
     
     # 添加重试机制
     local retry_count=3
@@ -102,46 +190,32 @@ get_beiqi7_keys() {
         if curl -sf "$github_keys_url" -o "$temp_keys"; then
             if [[ -s "$temp_keys" ]]; then
                 local key_count=$(wc -l < "$temp_keys")
-                echo "找到 $key_count 个公钥:"
-                echo "----------------------------------------"
-                cat "$temp_keys" | nl -w2 -s') '
-                echo "----------------------------------------"
+                echo "为用户 $user 找到 $key_count 个公钥"
                 
-                # 检测是否通过管道运行
-                if [[ -t 0 ]]; then
-                    read -p "是否添加所有公钥? [Y/n]: " confirm
-                    confirm=${confirm:-Y}
-                else
-                    confirm="Y"
-                    echo "检测到管道模式，自动确认添加公钥..."
+                # 创建临时文件并设置权限
+                local temp_auth="/tmp/authorized_keys_${user}_$$"
+                touch "$temp_auth"
+                chmod 600 "$temp_auth"
+                
+                # 如果已有authorized_keys，先复制
+                if [[ -f "$ssh_dir/authorized_keys" ]]; then
+                    cat "$ssh_dir/authorized_keys" > "$temp_auth"
                 fi
                 
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    # 创建临时文件并设置权限
-                    local temp_auth="/tmp/authorized_keys_$$"
-                    touch "$temp_auth"
-                    chmod 600 "$temp_auth"
-                    
-                    # 如果已有authorized_keys，先复制
-                    if [[ -f "$ssh_dir/authorized_keys" ]]; then
-                        cat "$ssh_dir/authorized_keys" > "$temp_auth"
-                    fi
-                    
-                    # 添加新密钥
-                    cat "$temp_keys" >> "$temp_auth"
-                    
-                    # 原子性移动文件
-                    mv "$temp_auth" "$ssh_dir/authorized_keys"
-                    chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir/authorized_keys"
-                    
-                    log "已成功添加 $key_count 个公钥"
-                    rm -f "$temp_keys"
-                    return 0
-                else
-                    error "操作已取消，无法继续配置 SSH 安全设置"
-                fi
+                # 添加新密钥
+                cat "$temp_keys" >> "$temp_auth"
+                
+                # 原子性移动文件
+                mv "$temp_auth" "$ssh_dir/authorized_keys"
+                chown "$user:$user" "$ssh_dir/authorized_keys"
+                
+                log "已成功为用户 $user 添加 $key_count 个公钥"
+                rm -f "$temp_keys"
+                return 0
             else
                 warn "GitHub 用户 beiqi7 没有公开的 SSH 密钥"
+                rm -f "$temp_keys"
+                return 1
             fi
         else
             warn "第 $i 次尝试失败，等待 $retry_delay 秒后重试..."
@@ -153,39 +227,6 @@ get_beiqi7_keys() {
     error "无法获取 GitHub 用户 beiqi7 的公钥，请检查网络连接"
 }
 
-# 配置密钥认证
-setup_key_auth() {
-    local user_home=$(eval echo ~$CURRENT_USER)
-    local ssh_dir="$user_home/.ssh"
-    
-    # 创建 .ssh 目录
-    if [[ ! -d "$ssh_dir" ]]; then
-        mkdir -p "$ssh_dir"
-        chown "$CURRENT_USER:$CURRENT_USER" "$ssh_dir"
-        chmod 700 "$ssh_dir"
-        log "已创建 .ssh 目录: $ssh_dir"
-    fi
-    
-    # 检查是否已有密钥
-    if [[ -f "$ssh_dir/authorized_keys" ]] && [[ -s "$ssh_dir/authorized_keys" ]]; then
-        log "检测到已有 SSH 密钥配置"
-        if [[ -t 0 ]]; then
-            read -p "是否追加新的公钥? [Y/n]: " append_key
-            append_key=${append_key:-Y}
-            if [[ ! "$append_key" =~ ^[Yy]$ ]]; then
-                log "保持现有密钥配置"
-                return 0
-            fi
-        else
-            echo "检测到管道模式，自动确认追加公钥..."
-            append_key="Y"
-        fi
-    fi
-    
-    # 直接从 beiqi7 GitHub 获取公钥
-    get_beiqi7_keys
-}
-
 # 更新SSH配置（不覆盖整个文件）
 update_ssh_config() {
     local config_file="/etc/ssh/sshd_config"
@@ -195,18 +236,18 @@ update_ssh_config() {
     # 复制原配置
     cp "$config_file" "$temp_config"
     
-    # 定义要更新的配置项
+    # 定义要更新的配置项（严格安全配置）
     declare -A configs=(
         ["Port"]="$new_port"
         ["Protocol"]="2"
         ["PubkeyAuthentication"]="yes"
-        ["PasswordAuthentication"]="no"
+        ["PasswordAuthentication"]="no"  # 关闭密码认证
         ["PermitEmptyPasswords"]="no"
         ["ChallengeResponseAuthentication"]="no"
-        ["PermitRootLogin"]="no"
-        ["AllowUsers"]="$CURRENT_USER"
+        ["PermitRootLogin"]="yes"  # 允许root登录（使用公钥）
+        ["AllowUsers"]="root $CURRENT_USER"  # 明确允许root和配置的用户
         ["MaxAuthTries"]="3"
-        ["MaxSessions"]="2"
+        ["MaxSessions"]="5"
         ["ClientAliveInterval"]="300"
         ["ClientAliveCountMax"]="2"
         ["LoginGraceTime"]="60"
@@ -370,25 +411,31 @@ show_summary() {
     local ssh_port=$(grep "^Port" /etc/ssh/sshd_config | awk '{print $2}')
     local backup_path=$(cat /tmp/ssh_backup_path 2>/dev/null || echo "未知")
     local server_ip=$(hostname -I | awk '{print $1}')
+    local password_auth=$(grep "^PasswordAuthentication" /etc/ssh/sshd_config | awk '{print $2}')
+    local root_login=$(grep "^PermitRootLogin" /etc/ssh/sshd_config | awk '{print $2}')
+    local allowed_users=$(grep "^AllowUsers" /etc/ssh/sshd_config | cut -d' ' -f2-)
     
     echo
     echo "========================================"
     echo "           SSH 配置完成摘要"
     echo "========================================"
     echo "SSH 端口: $ssh_port"
-    echo "允许用户: $CURRENT_USER"
-    echo "认证方式: 仅密钥认证 (从 GitHub beiqi7 获取)"
-    echo "Root 登录: 已禁用"
+    echo "已配置用户: $allowed_users"
+    echo "密码认证: $password_auth (已关闭)"
+    echo "公钥认证: yes (仅公钥认证)"
+    echo "Root 登录: $root_login (仅公钥)"
     echo "配置备份: $backup_path"
     echo "服务器 IP: $server_ip"
     echo "========================================"
     echo
     warn "重要提醒:"
-    echo "1. 请确保已保存相应的私钥"
-    echo "2. 建议先测试新配置，不要立即关闭当前会话"
-    echo "3. 测试连接命令: ssh -p $ssh_port $CURRENT_USER@$server_ip"
-    echo "4. 如遇问题，可从备份恢复: $backup_path/sshd_config"
-    echo "5. 一键脚本地址: curl -sSL https://raw.githubusercontent.com/beiqi7/ssh-security/main/setup.sh | sudo bash"
+    echo "1. SSH已配置为仅公钥认证，密码认证已关闭"
+    echo "2. 已为 root 和 $CURRENT_USER 用户添加了 GitHub beiqi7 的公钥"
+    echo "3. 仅允许 root 和 $CURRENT_USER 用户登录"
+    echo "4. 请确保已保存对应的私钥文件"
+    echo "5. 测试连接: ssh -p $ssh_port root@$server_ip"
+    echo "6. 如遇问题，可使用应急恢复: curl -sSL https://raw.githubusercontent.com/beiqi7/ssh-security/main/setup.sh | sudo bash -s -- --recover"
+    echo "7. 或手动恢复: sudo bash setup.sh --recover"
     echo
     
     # 清理临时文件
