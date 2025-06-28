@@ -55,7 +55,26 @@ get_user_info() {
     if [[ -n "$SUDO_USER" ]]; then
         CURRENT_USER="$SUDO_USER"
     else
-        read -p "请输入要保留 SSH 访问权限的用户名: " CURRENT_USER
+        # 检测是否通过管道运行
+        if [[ -t 0 ]]; then
+            read -p "请输入要保留 SSH 访问权限的用户名: " CURRENT_USER
+        else
+            # 管道模式下，尝试自动确定用户
+            if [[ "$USER" != "root" ]]; then
+                CURRENT_USER="$USER"
+                echo "检测到管道模式，自动选择用户: $CURRENT_USER"
+            else
+                # 如果是root用户，尝试找到第一个普通用户
+                CURRENT_USER=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 {print $1; exit}')
+                if [[ -n "$CURRENT_USER" ]]; then
+                    echo "检测到管道模式，自动选择用户: $CURRENT_USER"
+                else
+                    # 如果找不到普通用户，使用root
+                    CURRENT_USER="root"
+                    echo "检测到管道模式，使用root用户"
+                fi
+            fi
+        fi
     fi
     
     if ! id "$CURRENT_USER" &>/dev/null; then
@@ -157,6 +176,9 @@ setup_key_auth() {
                 log "保持现有密钥配置"
                 return 0
             fi
+        else
+            echo "检测到管道模式，自动确认追加公钥..."
+            append_key="Y"
         fi
     fi
     
